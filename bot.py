@@ -21,7 +21,16 @@ load_dotenv()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SEGMENT_SECONDS = int(os.getenv("SEGMENT_SECONDS", "60"))
 # Папка data/ на BotHost сохраняется между пересборками
-FONT_PATH = shorts.resolve_font(os.getenv("FONT_PATH"), Path(__file__).parent / "data")
+DATA_DIR = Path(__file__).parent / "data"
+FONT_PATH = shorts.resolve_font(os.getenv("FONT_PATH"), DATA_DIR)
+# cookies.txt YouTube-аккаунта (формат Netscape) — без них YouTube часто не пускает сервер
+COOKIES = Path(os.getenv("COOKIES_FILE") or DATA_DIR / "cookies.txt")
+LOGIN_HELP = (
+    "❌ YouTube не пускает сервер бота без входа в аккаунт («подтвердите, что вы не бот»).\n\n"
+    "Нужен файл cookies YouTube: выгрузите его расширением «Get cookies.txt LOCALLY» "
+    "(лучше с запасного аккаунта) и загрузите на BotHost в папку <code>data</code> "
+    "под именем <code>cookies.txt</code>. Ссылки с TikTok и других сайтов работают и без этого."
+)
 STYLE = shorts.Style(
     text_color=os.getenv("TEXT_COLOR", "#9B30D0"),
     box_color=os.getenv("BOX_COLOR", "white"),
@@ -159,7 +168,7 @@ async def process(msg: Message, bot: Bot, uid: int, url: str, custom_title: str 
         status = await msg.answer("⏬ Скачиваю…")
         workdir = Path(tempfile.mkdtemp(prefix="shorts_"))
         try:
-            src = await asyncio.to_thread(shorts.download, url, workdir)
+            src = await asyncio.to_thread(shorts.download, url, workdir, COOKIES)
             if custom_title:
                 src.title = custom_title
             if src.duration > MAX_DURATION:
@@ -190,6 +199,12 @@ async def process(msg: Message, bot: Bot, uid: int, url: str, custom_title: str 
                     )
                     path.unlink(missing_ok=True)
             await status.edit_text(f"✅ Готово: {total} ч.")
+        except shorts.LoginRequired:
+            logging.warning("YouTube требует cookies: %s", url)
+            await status.edit_text(LOGIN_HELP if not COOKIES.is_file() else
+                                   "❌ YouTube не принял cookies — похоже, они устарели. "
+                                   "Выгрузите <code>cookies.txt</code> заново и замените файл в папке "
+                                   "<code>data</code> на BotHost.")
         except Exception as e:
             logging.exception("Ошибка обработки %s", url)
             await status.edit_text(f"❌ Ошибка: {str(e)[:300]}")

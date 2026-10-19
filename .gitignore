@@ -1,0 +1,5 @@
+.env
+data/
+cookies.txt
+__pycache__/
+test_out/

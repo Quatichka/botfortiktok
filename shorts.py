@@ -58,7 +58,11 @@ def clean_title(raw: str) -> str:
     return text or "Видео"
 
 
-def download(url: str, workdir: Path) -> Downloaded:
+class LoginRequired(RuntimeError):
+    """YouTube требует подтвердить, что запрос не от бота (нужны cookies)."""
+
+
+def download(url: str, workdir: Path, cookies: Path | None = None) -> Downloaded:
     opts = {
         "outtmpl": str(workdir / "source.%(ext)s"),
         # res — меньшая сторона кадра, так что 1080 подходит и для горизонтальных, и для
@@ -75,8 +79,16 @@ def download(url: str, workdir: Path) -> Downloaded:
         "noprogress": True,
         "no_warnings": True,
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    # YouTube часто не пускает IP дата-центров без входа в аккаунт — тогда нужны cookies
+    if cookies and cookies.is_file():
+        opts["cookiefile"] = str(cookies)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except yt_dlp.utils.DownloadError as e:
+        if "confirm you" in str(e) and "not a bot" in str(e):
+            raise LoginRequired(str(e)) from e
+        raise
     files = sorted(workdir.glob("source.*"))
     if not files:
         raise RuntimeError("yt-dlp ничего не скачал")
