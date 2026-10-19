@@ -151,7 +151,7 @@ async def choose_banner(cb: CallbackQuery, bot: Bot, bid: str):
     banner = banners.get_banner(bid) if bid != "none" else None
     if banner:
         await cb.message.edit_text(f"Баннер: <b>{banners.COMPANY_BY_BANNER[bid].variants[bid]}</b>\n\n"
-                                   f"{banners.company_card(banner.company)}")
+                                   f"{banners.company_card(banner.company, banner.probe(shorts.FFMPEG))}")
     else:
         await cb.message.edit_text("Нарезаю без баннера.")
     await process(cb.message, bot, uid, url, custom_title, banner)

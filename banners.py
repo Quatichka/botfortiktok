@@ -291,6 +291,11 @@ class Banner:
     def starts(self, d: float) -> list[float]:
         return TIMINGS[self.rule.timing](d, self.duration)
 
+    @property
+    def pauses(self) -> bool:
+        """Пауза только у баннеров с озвучкой: беззвучный баннер идёт поверх видео."""
+        return self.rule.pause and self.has_audio
+
 
 def get_banner(bid: str) -> Banner | None:
     company = COMPANY_BY_BANNER.get(bid)
@@ -305,15 +310,18 @@ def _esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def company_card(c: Company) -> str:
+def company_card(c: Company, banner: Banner | None = None) -> str:
     lines = [f"<b>{_esc(c.name)}</b>  ·  {_esc(c.contacts)}", "", "<b>Расценки (за 100 000 просмотров):</b>"]
     for platform, kind, rate, cond in c.rates:
         tail = f" — <i>{_esc(cond)}</i>" if cond else ""
         lines.append(f"• {_esc(platform)}, {_esc(kind)}: <b>{_esc(rate)}</b>{tail}")
     lines += ["", "<b>Условия:</b>"] + [f"• {_esc(t)}" for t in c.terms]
     lines += ["", f"🎯 <b>Бот поставит баннер:</b> {_esc(c.how)}"]
-    if c.rule.pause:
-        lines.append("⏸ На время баннера основное видео встаёт на паузу — звучит только реклама")
+    if banner:
+        lines.append("⏸ На время баннера основное видео встаёт на паузу — звучит только реклама"
+                     if banner.pauses else "▶️ Баннер без озвучки — идёт поверх видео, без паузы")
+    elif c.rule.pause:
+        lines.append("⏸ Баннеры с озвучкой ставят видео на паузу, беззвучные идут поверх")
     return "\n".join(lines)
 
 

@@ -203,7 +203,7 @@ def _banner_graph(banner: Banner, d: float, src_audio: bool) -> tuple[str, str, 
     rule = banner.rule
     audio_in = "[0:a]" if src_audio else f"anullsrc=r=44100:cl=stereo,atrim=0:{d:.3f},"
 
-    if rule.pause:
+    if banner.pauses:
         # Где резать исходник: момент показа минус уже вставленные паузы
         cuts, prev = [], 0.0
         for i, t in enumerate(starts):
@@ -279,7 +279,7 @@ def _banner_graph(banner: Banner, d: float, src_audio: bool) -> tuple[str, str, 
 
     # Звук: основной приглушаем на время баннера, звук баннера подмешиваем в нужные моменты
     windows = "+".join(f"between(t,{t:.3f},{t + b:.3f})" for t in shown)
-    duck = f"volume=enable='{windows}':volume={rule.duck}" if rule.duck < 1 and not rule.pause else "anull"
+    duck = f"volume=enable='{windows}':volume={rule.duck}" if rule.duck < 1 and banner.has_audio and not banner.pauses else "anull"
     aud = f"[ca]{duck}[main];"
     if banner.has_audio:
         acopies = "".join(f"[ba{i}]" for i in range(n))
