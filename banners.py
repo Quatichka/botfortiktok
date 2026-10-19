@@ -4,6 +4,7 @@
 у рекламодателей меняются часто: перед публикацией сверяйтесь с их каналами.
 """
 import math
+from functools import lru_cache
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -297,6 +298,7 @@ class Banner:
         return self.rule.pause and self.has_audio
 
 
+@lru_cache(maxsize=None)  # один объект на баннер — длительность и размер меряем один раз
 def get_banner(bid: str) -> Banner | None:
     company = COMPANY_BY_BANNER.get(bid)
     if not company:
@@ -323,6 +325,26 @@ def company_card(c: Company, banner: Banner | None = None) -> str:
     elif c.rule.pause:
         lines.append("⏸ Баннеры с озвучкой ставят видео на паузу, беззвучные идут поверх")
     return "\n".join(lines)
+
+
+def banner_caption(banner: Banner) -> str:
+    """Подпись к макету вставки: коротко о главном, полные условия — в раскрывающемся блоке.
+    Подпись к фото в Telegram — до 1024 символов."""
+    c = banner.company
+    head = [f"✅ <b>{_esc(c.variants[banner.id])}</b>", ""]
+    head += [f"💰 {_esc(p)}, {_esc(k)}: <b>{_esc(r)}</b>" for p, k, r, _ in c.rates[:3]]
+    head += ["", f"🎯 {_esc(c.how)}",
+             "⏸ Видео на паузе, пока звучит реклама" if banner.pauses
+             else "▶️ Баннер без звука — поверх видео, без паузы",
+             "", "⏳ Начинаю нарезку…"]
+    text = "\n".join(head)
+    room = 1000 - len(text) - len("<blockquote expandable></blockquote>\n") - len(c.contacts) - 30
+    if room > 80:
+        # Режем до экранирования, чтобы не разорвать HTML-сущность
+        terms = _esc("\n".join(f"• {t}" for t in c.terms)[:room])
+        text = text.replace("\n\n⏳", f"\n\n📋 <b>Условия</b> · {_esc(c.contacts)}"
+                            f"<blockquote expandable>{terms}</blockquote>\n⏳", 1)
+    return text
 
 
 def rates_table() -> str:
