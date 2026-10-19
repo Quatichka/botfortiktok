@@ -9,6 +9,8 @@ from pathlib import Path
 import yt_dlp
 from PIL import Image, ImageDraw, ImageFont
 
+from banners import Banner
+
 W, H = 1080, 1920
 
 
@@ -170,8 +172,86 @@ def make_overlay(title: str, label: str, font_path: Path, st: Style, out: Path) 
     img.save(out)
 
 
+def has_audio(path: Path) -> bool:
+    err = subprocess.run([FFMPEG, "-hide_banner", "-i", str(path)], capture_output=True,
+                         text=True, encoding="utf-8", errors="replace").stderr
+    return "Audio:" in err
+
+
+def _banner_graph(banner: Banner, d: float, src_audio: bool) -> tuple[str, str, str, float]:
+    """Фильтры для баннера. Возвращает (подготовка контента, наложение, звук, итоговая длина).
+
+    Контент — [cv]/[ca]; наложение берёт [lay] и отдаёт [v]; звук отдаёт [a].
+    В режиме паузы основное видео разрезается в моменты показа, кадр замирает на время
+    баннера, а основной звук на это время молчит — длина ролика растёт.
+    """
+    b = banner.duration
+    starts = sorted(t for t in banner.starts(d) if t < d)
+    rule = banner.rule
+    audio_in = "[0:a]" if src_audio else f"anullsrc=r=44100:cl=stereo,atrim=0:{d:.3f},"
+
+    if rule.pause:
+        cuts = [0.0] + starts + [d]
+        n = len(cuts) - 1
+        parts_v = "".join(f"[s{i}]" for i in range(n))
+        parts_a = "".join(f"[t{i}]" for i in range(n))
+        pre = f"[0:v]split={n}{parts_v};{audio_in}asplit={n}{parts_a};"
+        concat = ""
+        for i in range(n):
+            a, z = cuts[i], cuts[i + 1]
+            freeze = f",tpad=stop_mode=clone:stop_duration={b:.3f}" if i < n - 1 else ""
+            silence = f",apad=pad_dur={b:.3f}" if i < n - 1 else ""
+            pre += (f"[s{i}]trim={a:.3f}:{z:.3f},setpts=PTS-STARTPTS{freeze}[sv{i}];"
+                    f"[t{i}]atrim={a:.3f}:{z:.3f},asetpts=PTS-STARTPTS{silence}[ta{i}];")
+            concat += f"[sv{i}][ta{i}]"
+        pre += f"{concat}concat=n={n}:v=1:a=1[cv][ca];"
+        shown = [t + i * b for i, t in enumerate(starts)]
+        total = d + len(starts) * b
+    else:
+        pre = f"[0:v]null[cv];{audio_in}anull[ca];"
+        shown = starts
+        total = d
+
+    # Баннер: верх кадра — цвет, низ — маска прозрачности (см. tools/prepare_banners.py)
+    bw = int(W * rule.width) // 2 * 2
+    bh = int(bw * banner.h / banner.w) // 2 * 2
+    x = (W - bw) // 2
+    y = {"center": (H - bh) // 2,
+         "video_top": VIDEO_Y + 20,
+         "video_bottom": VIDEO_Y + VIDEO_H - bh - 20}[rule.pos]
+    n = len(shown)
+    copies = "".join(f"[bn{i}]" for i in range(n))
+    lay = (f"[2:v]split[bc][bm];[bc]crop=iw:ih/2:0:0[bcol];"
+           f"[bm]crop=iw:ih/2:0:ih/2,format=gray[bmask];"
+           f"[bcol][bmask]alphamerge,scale={bw}:{bh},format=yuva420p,split={n}{copies};")
+    cur = "[lay]"
+    for i, t in enumerate(shown):
+        nxt = "[v]" if i == n - 1 else f"[l{i}]"
+        lay += (f"[bn{i}]setpts=PTS-STARTPTS+{t:.3f}/TB[bo{i}];"
+                f"{cur}[bo{i}]overlay={x}:{y}:eof_action=pass{nxt};")
+        cur = nxt
+
+    # Звук: основной приглушаем на время баннера, звук баннера подмешиваем в нужные моменты
+    windows = "+".join(f"between(t,{t:.3f},{t + b:.3f})" for t in shown)
+    duck = f"volume=enable='{windows}':volume={rule.duck}" if rule.duck < 1 and not rule.pause else "anull"
+    aud = f"[ca]{duck}[main];"
+    if banner.has_audio:
+        acopies = "".join(f"[ba{i}]" for i in range(n))
+        aud += f"[2:a]asplit={n}{acopies};"
+        mix = "[main]"
+        for i, t in enumerate(shown):
+            ms = int(t * 1000)
+            aud += f"[ba{i}]adelay={ms}|{ms}[bd{i}];"
+            mix += f"[bd{i}]"
+        aud += f"{mix}amix=inputs={n + 1}:duration=first:normalize=0[a]"
+    else:
+        aud += "[main]anull[a]"
+    return pre, lay.rstrip(";"), aud, total
+
+
 def render_part(src: Downloaded, workdir: Path, font: Path, index: int, total: int,
-                start: float, length: float, st: Style | None = None) -> Path:
+                start: float, length: float, st: Style | None = None,
+                banner: Banner | None = None) -> Path:
     st = st or Style()
     overlay = workdir / f"overlay_{index:02d}.png"
     make_overlay(src.title, st.part_label.format(n=index, total=total), font, st, overlay)
@@ -180,20 +260,30 @@ def render_part(src: Downloaded, workdir: Path, font: Path, index: int, total: i
         fg = f"scale={W}:{VIDEO_H}:force_original_aspect_ratio=increase,crop={W}:{VIDEO_H}"
     else:
         fg = f"scale={W}:{VIDEO_H}:force_original_aspect_ratio=decrease"
-    graph = (
-        f"color=black:s={W}x{H}:r=30[bg];[0:v]{fg},setsar=1[fg];"
+    layout = (
+        f"color=black:s={W}x{H}:r=30[bg];[CV]{fg},setsar=1[fg];"
         f"[bg][fg]overlay=(W-w)/2:{VIDEO_Y}+({VIDEO_H}-h)/2:shortest=1[base];"
-        f"[base][1:v]overlay=0:0[v]"
+        f"[base][1:v]overlay=0:0[OUT]"
     )
+    banner_input: list[str] = []
+    if banner:
+        banner.probe(FFMPEG)
+        pre, lay, aud, _ = _banner_graph(banner, length, has_audio(src.path))
+        graph = f"{pre}{layout.replace('[CV]', '[cv]').replace('[OUT]', '[lay]')};{lay};{aud}"
+        audio_map = "[a]"
+        banner_input = ["-i", str(banner.path)]
+    else:
+        graph = layout.replace("[CV]", "[0:v]").replace("[OUT]", "[v]")
+        audio_map = "0:a?"
 
     out = workdir / f"part_{index:02d}.mp4"
     # Потоки и lookahead ограничены, чтобы ffmpeg укладывался в небольшую память хостинга
     cmd = [
         FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
         "-threads", "2", "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(src.path),
-        "-i", str(overlay),
+        "-i", str(overlay), *banner_input,
         "-filter_complex", graph, "-filter_complex_threads", "1",
-        "-map", "[v]", "-map", "0:a?",
+        "-map", "[v]", "-map", audio_map,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
         "-threads", "2", "-x264-params", "rc-lookahead=10",
         "-maxrate", "5M", "-bufsize", "10M", "-pix_fmt", "yuv420p", "-r", "30",
