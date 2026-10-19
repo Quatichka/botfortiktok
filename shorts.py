@@ -59,10 +59,16 @@ def clean_title(raw: str) -> str:
 def download(url: str, workdir: Path) -> Downloaded:
     opts = {
         "outtmpl": str(workdir / "source.%(ext)s"),
-        "format": "bv*[height<=1920]+ba/b[height<=1920]/bv*+ba/b",
+        # res — меньшая сторона кадра, так что 1080 подходит и для горизонтальных, и для
+        # вертикальных видео. H.264 декодируется дешевле VP9/AV1 — важно при 1 ГБ RAM
+        "format": "bv*+ba/b",
+        "format_sort": ["res:1080", "vcodec:h264", "acodec:m4a"],
         "merge_output_format": "mp4",
         "ffmpeg_location": FFMPEG,
         "noplaylist": True,
+        "socket_timeout": 60,
+        "retries": 10,
+        "fragment_retries": 10,
         "quiet": True,
         "noprogress": True,
         "no_warnings": True,
@@ -181,12 +187,15 @@ def render_part(src: Downloaded, workdir: Path, font: Path, index: int, total: i
     )
 
     out = workdir / f"part_{index:02d}.mp4"
+    # Потоки и lookahead ограничены, чтобы ffmpeg укладывался в небольшую память хостинга
     cmd = [
         FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-        "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(src.path),
+        "-threads", "2", "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(src.path),
         "-i", str(overlay),
-        "-filter_complex", graph, "-map", "[v]", "-map", "0:a?",
+        "-filter_complex", graph, "-filter_complex_threads", "1",
+        "-map", "[v]", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-threads", "2", "-x264-params", "rc-lookahead=10",
         "-maxrate", "5M", "-bufsize", "10M", "-pix_fmt", "yuv420p", "-r", "30",
         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
         str(out),
@@ -196,5 +205,7 @@ def render_part(src: Downloaded, workdir: Path, font: Path, index: int, total: i
     if res.returncode != 0:
         # Граф фильтров длинный и забивает сообщение — вырезаем его
         err = res.stderr.replace(graph, "<filters>").strip()
-        raise RuntimeError(f"ffmpeg: {err[:400]}")
+        if res.returncode in (-9, 137) and not err:
+            raise RuntimeError("ffmpeg убит системой — скорее всего, не хватило памяти")
+        raise RuntimeError(f"ffmpeg (код {res.returncode}): {err[:400] or 'без сообщения'}")
     return out
