@@ -194,8 +194,9 @@ def _banner_graph(banner: Banner, d: float, src_audio: bool) -> tuple[str, str, 
     """Фильтры для баннера. Возвращает (подготовка контента, наложение, звук, итоговая длина).
 
     Контент — [cv]/[ca]; наложение берёт [lay] и отдаёт [v]; звук отдаёт [a].
-    В режиме паузы основное видео разрезается в моменты показа, кадр замирает на время
-    баннера, а основной звук на это время молчит — длина ролика растёт.
+    В режиме паузы основное видео разрезается, кадр замирает на время баннера, а основной
+    звук молчит — длина ролика растёт. Моменты показа из правил соблюдаются на итоговом
+    ролике: второй баннер на 1:30 так и будет на 1:30, с учётом пауз перед ним.
     """
     b = banner.duration
     starts = sorted(t for t in banner.starts(d) if t < d)
@@ -203,21 +204,54 @@ def _banner_graph(banner: Banner, d: float, src_audio: bool) -> tuple[str, str, 
     audio_in = "[0:a]" if src_audio else f"anullsrc=r=44100:cl=stereo,atrim=0:{d:.3f},"
 
     if rule.pause:
-        cuts = [0.0] + starts + [d]
-        n = len(cuts) - 1
+        # Где резать исходник: момент показа минус уже вставленные паузы
+        cuts, prev = [], 0.0
+        for i, t in enumerate(starts):
+            prev = max(prev, min(d, t - i * b))
+            cuts.append(prev)
+        bounds = [0.0] + cuts + [d]
+        # Куски исходника: [начало, конец, замирание в начале, замирание в конце].
+        # Пустой кусок (баннер в самом начале или две паузы подряд) не режем — его
+        # замирание переносим на соседний кусок
+        pieces, carry = [], 0.0
+        for k in range(len(bounds) - 1):
+            a, z = bounds[k], bounds[k + 1]
+            pad = b if k < len(starts) else 0.0
+            if z - a < 0.04:
+                if pieces:
+                    pieces[-1][3] += pad
+                else:
+                    carry += pad
+            else:
+                pieces.append([a, z, carry, pad])
+                carry = 0.0
+        # Замирание в начале куска делаем отдельным кусочком из его первого кадра:
+        # tpad со start_duration в статических сборках ffmpeg не удлиняет видео
+        segs = []  # (начало, конец, замирание в конце, только кадр-заглушка)
+        for a, z, sp, ep in pieces:
+            if sp:
+                segs.append((a, a + 0.04, sp, True))
+            segs.append((a, z, ep, False))
+        n = len(segs)
         parts_v = "".join(f"[s{i}]" for i in range(n))
         parts_a = "".join(f"[t{i}]" for i in range(n))
         pre = f"[0:v]split={n}{parts_v};{audio_in}asplit={n}{parts_a};"
         concat = ""
-        for i in range(n):
-            a, z = cuts[i], cuts[i + 1]
-            freeze = f",tpad=stop_mode=clone:stop_duration={b:.3f}" if i < n - 1 else ""
-            silence = f",apad=pad_dur={b:.3f}" if i < n - 1 else ""
-            pre += (f"[s{i}]trim={a:.3f}:{z:.3f},setpts=PTS-STARTPTS{freeze}[sv{i}];"
-                    f"[t{i}]atrim={a:.3f}:{z:.3f},asetpts=PTS-STARTPTS{silence}[ta{i}];")
+        for i, (a, z, ep, still) in enumerate(segs):
+            if still:
+                # Один кадр, растянутый на длину баннера, и тишина той же длины
+                v = (f"trim=start={a:.3f}:duration=0.04,setpts=PTS-STARTPTS,"
+                     f"tpad=stop_mode=clone:stop_duration={ep:.3f},trim=duration={ep:.3f}")
+                au = (f"atrim=start={a:.3f}:duration=0.04,asetpts=PTS-STARTPTS,volume=0,"
+                      f"apad=whole_dur={ep:.3f}")
+            else:
+                v = f"trim={a:.3f}:{z:.3f},setpts=PTS-STARTPTS" + \
+                    (f",tpad=stop_mode=clone:stop_duration={ep:.3f}" if ep else "")
+                au = f"atrim={a:.3f}:{z:.3f},asetpts=PTS-STARTPTS" + (f",apad=pad_dur={ep:.3f}" if ep else "")
+            pre += f"[s{i}]{v}[sv{i}];[t{i}]{au}[ta{i}];"
             concat += f"[sv{i}][ta{i}]"
         pre += f"{concat}concat=n={n}:v=1:a=1[cv][ca];"
-        shown = [t + i * b for i, t in enumerate(starts)]
+        shown = [cuts[i] + i * b for i in range(len(starts))]
         total = d + len(starts) * b
     else:
         pre = f"[0:v]null[cv];{audio_in}anull[ca];"
