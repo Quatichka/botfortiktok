@@ -38,6 +38,8 @@ STYLE = shorts.Style(
     box_color=os.getenv("BOX_COLOR", "white"),
     part_label=os.getenv("PART_LABEL", "PART {n}"),
     fit=os.getenv("VIDEO_FIT", "crop"),  # crop | fit
+    mirror=os.getenv("MIRROR", "1") != "0",
+    speed=float(os.getenv("SPEED", "1.1")),
 )
 MAX_DURATION = int(os.getenv("MAX_DURATION", "3600"))
 TG_LIMIT = 49 * 1024 * 1024  # лимит Bot API на отправку файла — 50 МБ
@@ -223,7 +225,9 @@ async def process(msg: Message, bot: Bot, uid: int, url: str, custom_title: str 
                 await status.edit_text(f"❌ Видео длиннее {MAX_DURATION // 60} мин — слишком длинное.")
                 return
 
-            parts = shorts.plan_parts(src.duration, user_seg.get(uid, SEGMENT_SECONDS))
+            # Видео ускоряется, поэтому из исходника берём больше секунд: готовая часть
+            # выйдет ровно той длины, что выбрал пользователь
+            parts = shorts.plan_parts(src.duration, user_seg.get(uid, SEGMENT_SECONDS) * STYLE.speed)
             total = len(parts)
             head = (f"🎞 <b>{html.escape(src.title)}</b>\n"
                     f"⏱ {int(src.duration // 60)}:{int(src.duration % 60):02d} → {total} ч."

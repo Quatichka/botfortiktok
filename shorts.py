@@ -127,6 +127,8 @@ class Style:
     fit: str = "crop"             # crop — обрезать по бокам и заполнить кадр, fit — вписать целиком
     title_size: int = 66
     part_size: int = 78
+    mirror: bool = True           # отзеркалить видео по горизонтали (надписи и баннеры — нет)
+    speed: float = 1.1            # ускорение видео и звука; тон звука не меняется
 
 
 # Макет 1080x1920 повторяет пример: название сверху, видео по центру, номер части под видео
@@ -201,7 +203,7 @@ def _banner_graph(banner: Banner, d: float, src_audio: bool) -> tuple[str, str, 
     b = banner.duration
     starts = sorted(t for t in banner.starts(d) if t < d)
     rule = banner.rule
-    audio_in = "[0:a]" if src_audio else f"anullsrc=r=44100:cl=stereo,atrim=0:{d:.3f},"
+    audio_in = "[ma]" if src_audio else f"anullsrc=r=44100:cl=stereo,atrim=0:{d:.3f},"
 
     if banner.pauses:
         # Где резать исходник: момент показа минус уже вставленные паузы
@@ -235,7 +237,7 @@ def _banner_graph(banner: Banner, d: float, src_audio: bool) -> tuple[str, str, 
         n = len(segs)
         parts_v = "".join(f"[s{i}]" for i in range(n))
         parts_a = "".join(f"[t{i}]" for i in range(n))
-        pre = f"[0:v]split={n}{parts_v};{audio_in}asplit={n}{parts_a};"
+        pre = f"[mv]split={n}{parts_v};{audio_in}asplit={n}{parts_a};"
         concat = ""
         for i, (a, z, ep, still) in enumerate(segs):
             if still:
@@ -254,7 +256,7 @@ def _banner_graph(banner: Banner, d: float, src_audio: bool) -> tuple[str, str, 
         shown = [cuts[i] + i * b for i in range(len(starts))]
         total = d + len(starts) * b
     else:
-        pre = f"[0:v]null[cv];{audio_in}anull[ca];"
+        pre = f"[mv]null[cv];{audio_in}anull[ca];"
         shown = starts
         total = d
 
@@ -311,16 +313,25 @@ def render_part(src: Downloaded, workdir: Path, font: Path, index: int, total: i
         f"[bg][fg]overlay=(W-w)/2:{VIDEO_Y}+({VIDEO_H}-h)/2:shortest=1[base];"
         f"[base][1:v]overlay=0:0[OUT]"
     )
+    # Основное видео: зеркало и ускорение. Дальше всё (баннеры, паузы, тайминги) считается
+    # уже по ускоренному видео, поэтому длина части d — после ускорения
+    src_audio = has_audio(src.path)
+    speed = st.speed if st.speed > 0 else 1.0
+    d = length / speed
+    prep = f"[0:v]{'hflip,' if st.mirror else ''}setpts=(PTS-STARTPTS)/{speed}[mv];"
+    if src_audio:
+        prep += f"[0:a]asetpts=PTS-STARTPTS,atempo={speed}[ma];"
+
     banner_input: list[str] = []
     if banner:
         banner.probe(FFMPEG)
-        pre, lay, aud, _ = _banner_graph(banner, length, has_audio(src.path))
-        graph = f"{pre}{layout.replace('[CV]', '[cv]').replace('[OUT]', '[lay]')};{lay};{aud}"
-        audio_map = "[a]"
+        pre, lay, aud, _ = _banner_graph(banner, d, src_audio)
+        graph = f"{prep}{pre}{layout.replace('[CV]', '[cv]').replace('[OUT]', '[lay]')};{lay};{aud}"
+        audio_map = ["-map", "[a]"]
         banner_input = ["-i", str(banner.path)]
     else:
-        graph = layout.replace("[CV]", "[0:v]").replace("[OUT]", "[v]")
-        audio_map = "0:a?"
+        graph = prep + layout.replace("[CV]", "[mv]").replace("[OUT]", "[v]")
+        audio_map = ["-map", "[ma]"] if src_audio else []
 
     out = workdir / f"part_{index:02d}.mp4"
     # Потоки и lookahead ограничены, чтобы ffmpeg укладывался в небольшую память хостинга
@@ -329,7 +340,7 @@ def render_part(src: Downloaded, workdir: Path, font: Path, index: int, total: i
         "-threads", "2", "-ss", f"{start:.3f}", "-t", f"{length:.3f}", "-i", str(src.path),
         "-i", str(overlay), *banner_input,
         "-filter_complex", graph, "-filter_complex_threads", "1",
-        "-map", "[v]", "-map", audio_map,
+        "-map", "[v]", *audio_map,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
         "-threads", "2", "-x264-params", "rc-lookahead=10",
         "-maxrate", "5M", "-bufsize", "10M", "-pix_fmt", "yuv420p", "-r", "30",
