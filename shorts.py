@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yt_dlp
+from yt_dlp.postprocessor import SponsorBlockPP
 from PIL import Image, ImageDraw, ImageFont
 
 from banners import Banner
@@ -49,6 +50,26 @@ class Downloaded:
     path: Path
     title: str
     duration: float
+    ads_removed: float = 0.0  # сколько секунд рекламы вырезано из исходника
+
+
+# Рекламные куски в самом ролике (не баннеры бота). SponsorBlock — разметка зрителей для
+# YouTube: sponsor — оплаченная интеграция, selfpromo — реклама своих товаров/каналов.
+AD_CATEGORIES = ["sponsor", "selfpromo"]
+# Главы, которые автор сам назвал рекламой
+AD_CHAPTERS = re.compile(r"(?i)(реклам|спонсор|интеграци|партн[её]р|sponsor|\bad\b|advert|promo)")
+
+
+class _SafeSponsorBlock(SponsorBlockPP):
+    """SponsorBlock, который не срывает скачивание: если сервис недоступен, просто
+    ничего не вырезаем по его базе."""
+
+    def run(self, info):
+        try:
+            return super().run(info)
+        except Exception as e:
+            self.report_warning(f"SponsorBlock недоступен, реклама не вырезана: {e}")
+            return [], info
 
 
 def clean_title(raw: str) -> str:
@@ -62,7 +83,8 @@ class LoginRequired(RuntimeError):
     """YouTube требует подтвердить, что запрос не от бота (нужны cookies)."""
 
 
-def download(url: str, workdir: Path, cookies: Path | None = None) -> Downloaded:
+def download(url: str, workdir: Path, cookies: Path | None = None,
+             cut_ads: bool = True) -> Downloaded:
     opts = {
         "outtmpl": str(workdir / "source.%(ext)s"),
         # res — меньшая сторона кадра, так что 1080 подходит и для горизонтальных, и для
@@ -84,6 +106,10 @@ def download(url: str, workdir: Path, cookies: Path | None = None) -> Downloaded
         opts["cookiefile"] = str(cookies)
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
+            if cut_ads:
+                # Только узнаём рекламные отрезки; режем сами (см. cut_ranges) — штатный
+                # вырезатель yt-dlp требует ffprobe, которого в imageio-ffmpeg нет
+                ydl.add_post_processor(_SafeSponsorBlock(ydl, categories=AD_CATEGORIES), when="after_filter")
             info = ydl.extract_info(url, download=True)
     except yt_dlp.utils.DownloadError as e:
         if "confirm you" in str(e) and "not a bot" in str(e):
@@ -94,8 +120,59 @@ def download(url: str, workdir: Path, cookies: Path | None = None) -> Downloaded
         raise RuntimeError("yt-dlp ничего не скачал")
     path = files[0]
     title = clean_title(info.get("title") or info.get("description") or "")
-    duration = float(info.get("duration") or probe_duration(path))
-    return Downloaded(path, title, duration)
+    duration = probe_duration(path)
+    removed = 0.0
+    if cut_ads:
+        ads = ad_ranges(info, duration)
+        if ads:
+            path = cut_ranges(path, ads, duration, workdir / "noads.mp4")
+            new_duration = probe_duration(path)
+            removed, duration = duration - new_duration, new_duration
+    return Downloaded(path, title, duration, removed)
+
+
+def ad_ranges(info: dict, duration: float) -> list[tuple[float, float]]:
+    """Рекламные отрезки: разметка SponsorBlock и главы, которые автор назвал рекламой."""
+    ranges = [(float(s["start_time"]), float(s["end_time"]))
+              for s in info.get("sponsorblock_chapters") or []
+              if s.get("category") in AD_CATEGORIES]
+    ranges += [(float(c["start_time"]), float(c["end_time"]))
+               for c in info.get("chapters") or []
+               if AD_CHAPTERS.search(c.get("title") or "")]
+    merged: list[list[float]] = []
+    for a, z in sorted((max(0.0, a), min(duration, z)) for a, z in ranges if z - a >= 1):
+        if merged and a <= merged[-1][1] + 0.5:
+            merged[-1][1] = max(merged[-1][1], z)
+        else:
+            merged.append([a, z])
+    # Больше половины ролика «реклама» — скорее ошибка разметки, ничего не режем
+    if sum(z - a for a, z in merged) > duration / 2:
+        return []
+    return [(a, z) for a, z in merged]
+
+
+def cut_ranges(src: Path, cuts: list[tuple[float, float]], duration: float, out: Path) -> Path:
+    """Склеивает ролик без вырезанных отрезков. Без перекодирования (stream copy), поэтому
+    быстро и почти без памяти; границы — по ближайшим ключевым кадрам."""
+    keep, pos = [], 0.0
+    for a, z in cuts:
+        if a - pos >= 0.5:
+            keep.append((pos, a))
+        pos = z
+    if duration - pos >= 0.5:
+        keep.append((pos, duration))
+    if not keep:
+        return src
+    listing = out.with_suffix(".txt")
+    name = src.resolve().as_posix().replace("'", r"'\''")
+    listing.write_text("".join(f"file '{name}'\ninpoint {a:.3f}\noutpoint {z:.3f}\n" for a, z in keep),
+                       encoding="utf-8")
+    res = subprocess.run([FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                          "-i", str(listing), "-c", "copy", "-movflags", "+faststart", str(out)],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if res.returncode != 0 or not out.is_file():
+        return src  # не получилось — нарезаем ролик целиком, а не падаем
+    return out
 
 
 def probe_duration(path: Path) -> float:

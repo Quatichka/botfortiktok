@@ -46,6 +46,8 @@ STYLE = shorts.Style(
 )
 SPEEDS = [1.0, 1.1, 1.2, 1.25, 1.5, 2.0, 2.5, 3.0]
 MAX_DURATION = int(os.getenv("MAX_DURATION", "3600"))
+# Вырезать рекламные интеграции из самого ролика (YouTube: SponsorBlock и главы «Реклама»)
+CUT_ADS = os.getenv("CUT_ADS", "1") != "0"
 TG_LIMIT = 49 * 1024 * 1024  # лимит Bot API на отправку файла — 50 МБ
 
 URL_RE = re.compile(r"https?://\S+")
@@ -286,7 +288,7 @@ async def process(msg: Message, bot: Bot, uid: int, url: str, custom_title: str 
         status = await msg.answer("⏬ <b>Скачиваю видео…</b>")
         workdir = Path(tempfile.mkdtemp(prefix="shorts_"))
         try:
-            src = await asyncio.to_thread(shorts.download, url, workdir, COOKIES)
+            src = await asyncio.to_thread(shorts.download, url, workdir, COOKIES, CUT_ADS)
             if custom_title:
                 src.title = custom_title
             if src.duration > MAX_DURATION:
@@ -301,7 +303,9 @@ async def process(msg: Message, bot: Bot, uid: int, url: str, custom_title: str 
             head = (f"🎞 <b>{html.escape(src.title)}</b>\n"
                     f"⏱ {int(src.duration // 60)}:{int(src.duration % 60):02d} → {total} ч."
                     + (f" · 📢 {html.escape(banner.company.name)}" if banner else "")
-                    + (f" · ⚡ {fmt_speed(style.speed)}" if style.speed != 1 else ""))
+                    + (f" · ⚡ {fmt_speed(style.speed)}" if style.speed != 1 else "")
+                    + (f"\n✂️ Вырезано рекламы из ролика: <b>{int(src.ads_removed // 60)}:"
+                       f"{int(src.ads_removed % 60):02d}</b>" if src.ads_removed else ""))
             await status.edit_text(f"{head}\n\n✂️ Готовлю нарезку…")
 
             async with render_sem:
