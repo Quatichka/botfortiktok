@@ -130,8 +130,9 @@ def welcome() -> bytes:
 
     y = 600
     x = 70
-    for text in ("/rates — расценки", "/length 45 — длина части", "ссылка | Название — своё название"):
-        x += _pill(d, x, y, text, _f(26), CARD_HI) + 16
+    for text in ("/rates — расценки", "/length 45 — длина части", "/speed — скорость 1–3x",
+                 "ссылка | Название"):
+        x += _pill(d, x, y, text, _f(22), CARD_HI) + 14
     return _png(img)
 
 

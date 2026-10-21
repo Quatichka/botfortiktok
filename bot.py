@@ -1,5 +1,6 @@
 """Телеграм-бот: присылаешь ссылку — получаешь видео, нарезанное на шортсы."""
 import asyncio
+import dataclasses
 import html
 import logging
 import os
@@ -38,9 +39,12 @@ STYLE = shorts.Style(
     box_color=os.getenv("BOX_COLOR", "white"),
     part_label=os.getenv("PART_LABEL", "PART {n}"),
     fit=os.getenv("VIDEO_FIT", "crop"),  # crop | fit
-    mirror=os.getenv("MIRROR", "1") != "0",
-    speed=float(os.getenv("SPEED", "1.1")),
+    mirror=os.getenv("MIRROR", "0") != "0",
+    speed=float(os.getenv("SPEED", "1.0")),   # скорость по умолчанию; каждый выбирает свою
+    contrast=float(os.getenv("CONTRAST", "1.04")),
+    saturation=float(os.getenv("SATURATION", "1.03")),
 )
+SPEEDS = [1.0, 1.1, 1.2, 1.25, 1.5, 2.0, 2.5, 3.0]
 MAX_DURATION = int(os.getenv("MAX_DURATION", "3600"))
 TG_LIMIT = 49 * 1024 * 1024  # лимит Bot API на отправку файла — 50 МБ
 
@@ -49,6 +53,7 @@ URL_RE = re.compile(r"https?://\S+")
 logging.basicConfig(level=logging.INFO)
 dp = Dispatcher()
 user_seg: dict[int, int] = {}
+user_speed: dict[int, float] = {}
 user_locks: dict[int, asyncio.Lock] = {}
 pending: dict[int, tuple[str, str | None]] = {}  # ссылка и своё название, пока выбирают баннер
 render_sem = asyncio.Semaphore(1)  # одновременно рендерим одно видео
@@ -71,7 +76,28 @@ def remember(key: str, sent: Message) -> None:
         _photo_ids[key] = sent.photo[-1].file_id
 
 
-def companies_kb() -> InlineKeyboardMarkup:
+def speed_of(uid: int) -> float:
+    return user_speed.get(uid, STYLE.speed)
+
+
+def fmt_speed(v: float) -> str:
+    return f"{v:g}x"
+
+
+def speed_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for v in SPEEDS:
+        kb.button(text=("▶️ " if v == 1 else "⚡ ") + fmt_speed(v), callback_data=f"sp:{v:g}")
+    kb.adjust(4)
+    return kb.as_markup()
+
+
+SPEED_TEXT = ("⚡ <b>Скорость видео</b>\n\nВидео и звук ускоряются, голос не становится писклявым. "
+              "Длина готовой части остаётся той же — бот берёт из исходника больше секунд.\n\n"
+              "Сейчас: <b>{cur}</b>. Выбери:")
+
+
+def companies_kb(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for c in banners.COMPANIES:
         sound = any(banners.get_banner(b).probe(shorts.FFMPEG).has_audio for b in c.variants)
@@ -79,6 +105,8 @@ def companies_kb() -> InlineKeyboardMarkup:
     kb.adjust(3)
     kb.row(InlineKeyboardButton(text="🚫 Без баннера", callback_data="bn:none"),
            InlineKeyboardButton(text="💰 Все расценки", callback_data="rates"))
+    kb.row(InlineKeyboardButton(text=f"⚡ Скорость видео: {fmt_speed(speed_of(uid))} — изменить",
+                                callback_data="speed"))
     return kb.as_markup()
 
 
@@ -92,11 +120,12 @@ def variants_kb(company: banners.Company) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-GALLERY_CAPTION = (
-    "🎬 <b>Видео получено!</b> Выбери баннер рекламодателя — или нарежь без рекламы.\n\n"
-    "🔊 — баннер со звуком (видео встаёт на паузу)   🔇 — беззвучный, поверх видео\n"
-    "<i>Ставка на плитке — за 100 000 просмотров</i>"
-)
+def gallery_caption(uid: int) -> str:
+    return ("🎬 <b>Видео получено!</b> Выбери баннер рекламодателя — или нарежь без рекламы.\n\n"
+            "🔊 — баннер со звуком (видео встаёт на паузу)   🔇 — беззвучный, поверх видео\n"
+            f"⚡ Скорость: <b>{fmt_speed(speed_of(uid))}</b> · ⏱ часть: "
+            f"<b>{user_seg.get(uid, SEGMENT_SECONDS)} с</b>\n"
+            "<i>Ставка на плитке — за 100 000 просмотров</i>")
 
 
 def progress_bar(done: int, total: int, width: int = 10) -> str:
@@ -111,7 +140,8 @@ async def start(msg: Message):
         caption=("👋 <b>Привет!</b> Я нарезаю видео на шортсы 9:16 и ставлю рекламные баннеры "
                  "по правилам рекламодателей — чтобы ролик подходил под выплату.\n\n"
                  "👇 <b>Просто пришли ссылку на видео</b>\n\n"
-                 f"⏱ Длина части сейчас: <b>{user_seg.get(msg.from_user.id, SEGMENT_SECONDS)} с</b>"),
+                 f"⏱ Длина части: <b>{user_seg.get(msg.from_user.id, SEGMENT_SECONDS)} с</b> · "
+                 f"⚡ скорость: <b>{fmt_speed(speed_of(msg.from_user.id))}</b>"),
     )
     remember("welcome", sent)
 
@@ -137,13 +167,50 @@ async def set_length(msg: Message, command: CommandObject):
     await msg.answer(f"✅ Длина части: <b>{sec} с</b>. Тайминги баннеров пересчитаются под неё.")
 
 
+@dp.message(Command("speed"))
+async def set_speed(msg: Message, command: CommandObject):
+    uid = msg.from_user.id
+    if command.args:
+        try:
+            v = float(command.args.replace(",", ".").rstrip("xх"))
+            if not 1 <= v <= 3:
+                raise ValueError
+        except ValueError:
+            await msg.answer("Скорость — от 1 до 3, например: /speed 1.5")
+            return
+        user_speed[uid] = round(v, 2)
+        await msg.answer(f"✅ Скорость видео: <b>{fmt_speed(user_speed[uid])}</b>")
+        return
+    await msg.answer(SPEED_TEXT.format(cur=fmt_speed(speed_of(uid))), reply_markup=speed_kb())
+
+
+@dp.callback_query(F.data == "speed")
+async def cb_speed_menu(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.edit_caption(caption=SPEED_TEXT.format(cur=fmt_speed(speed_of(cb.from_user.id))),
+                                  reply_markup=speed_kb())
+
+
+@dp.callback_query(F.data.startswith("sp:"))
+async def cb_speed(cb: CallbackQuery):
+    uid = cb.from_user.id
+    user_speed[uid] = float(cb.data[3:])
+    await cb.answer(f"Скорость {fmt_speed(user_speed[uid])}")
+    if cb.message.photo:
+        # Выбирали из галереи — возвращаемся к выбору баннера
+        await cb.message.edit_caption(caption=gallery_caption(uid), reply_markup=companies_kb(uid))
+    else:
+        await cb.message.edit_text(f"✅ Скорость видео: <b>{fmt_speed(user_speed[uid])}</b>")
+
+
 @dp.message(F.text.regexp(URL_RE))
 async def handle_link(msg: Message):
     url = URL_RE.search(msg.text).group(0)
     custom_title = msg.text.split("|", 1)[1].strip() if "|" in msg.text else None
     pending[msg.from_user.id] = (url, custom_title)
-    sent = await msg.answer_photo(await photo("gallery", visuals.gallery), caption=GALLERY_CAPTION,
-                                  reply_markup=companies_kb())
+    sent = await msg.answer_photo(await photo("gallery", visuals.gallery),
+                                  caption=gallery_caption(msg.from_user.id),
+                                  reply_markup=companies_kb(msg.from_user.id))
     remember("gallery", sent)
 
 
@@ -165,7 +232,8 @@ async def show(cb: CallbackQuery, key: str, render, args: tuple, caption: str,
 @dp.callback_query(F.data == "back")
 async def cb_back(cb: CallbackQuery):
     await cb.answer()
-    await show(cb, "gallery", visuals.gallery, (), GALLERY_CAPTION, companies_kb())
+    await show(cb, "gallery", visuals.gallery, (), gallery_caption(cb.from_user.id),
+               companies_kb(cb.from_user.id))
 
 
 @dp.callback_query(F.data.startswith("co:"))
@@ -227,11 +295,13 @@ async def process(msg: Message, bot: Bot, uid: int, url: str, custom_title: str 
 
             # Видео ускоряется, поэтому из исходника берём больше секунд: готовая часть
             # выйдет ровно той длины, что выбрал пользователь
-            parts = shorts.plan_parts(src.duration, user_seg.get(uid, SEGMENT_SECONDS) * STYLE.speed)
+            style = dataclasses.replace(STYLE, speed=speed_of(uid))
+            parts = shorts.plan_parts(src.duration, user_seg.get(uid, SEGMENT_SECONDS) * style.speed)
             total = len(parts)
             head = (f"🎞 <b>{html.escape(src.title)}</b>\n"
                     f"⏱ {int(src.duration // 60)}:{int(src.duration % 60):02d} → {total} ч."
-                    + (f" · 📢 {html.escape(banner.company.name)}" if banner else ""))
+                    + (f" · 📢 {html.escape(banner.company.name)}" if banner else "")
+                    + (f" · ⚡ {fmt_speed(style.speed)}" if style.speed != 1 else ""))
             await status.edit_text(f"{head}\n\n✂️ Готовлю нарезку…")
 
             async with render_sem:
@@ -240,7 +310,7 @@ async def process(msg: Message, bot: Bot, uid: int, url: str, custom_title: str 
                                            f"{progress_bar(i - 1, total)}")
                     path = await asyncio.to_thread(
                         shorts.render_part, src, workdir, FONT_PATH,
-                        i, total, start, length, STYLE, banner,
+                        i, total, start, length, style, banner,
                     )
                     if path.stat().st_size > TG_LIMIT:
                         await msg.answer(f"Часть {i} больше 50 МБ — Telegram не даст отправить.")
@@ -286,6 +356,7 @@ async def main():
         BotCommand(command="start", description="Как это работает"),
         BotCommand(command="rates", description="Расценки рекламодателей"),
         BotCommand(command="length", description="Длина части, например /length 45"),
+        BotCommand(command="speed", description="Скорость видео от 1x до 3x"),
     ])
     # Общие картинки рисуем заранее, чтобы первый пользователь не ждал
     asyncio.create_task(asyncio.to_thread(visuals.warm_up))

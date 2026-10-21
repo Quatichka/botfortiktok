@@ -127,8 +127,10 @@ class Style:
     fit: str = "crop"             # crop — обрезать по бокам и заполнить кадр, fit — вписать целиком
     title_size: int = 66
     part_size: int = 78
-    mirror: bool = True           # отзеркалить видео по горизонтали (надписи и баннеры — нет)
-    speed: float = 1.1            # ускорение видео и звука; тон звука не меняется
+    mirror: bool = False          # отзеркалить видео по горизонтали (надписи и баннеры — нет)
+    speed: float = 1.0            # ускорение видео и звука (1–3); тон звука не меняется
+    contrast: float = 1.04        # едва заметная правка цвета основного видео
+    saturation: float = 1.03
 
 
 # Макет 1080x1920 повторяет пример: название сверху, видео по центру, номер части под видео
@@ -318,7 +320,13 @@ def render_part(src: Downloaded, workdir: Path, font: Path, index: int, total: i
     src_audio = has_audio(src.path)
     speed = st.speed if st.speed > 0 else 1.0
     d = length / speed
-    prep = f"[0:v]{'hflip,' if st.mirror else ''}setpts=(PTS-STARTPTS)/{speed}[mv];"
+    look = []
+    if st.mirror:
+        look.append("hflip")
+    if st.contrast != 1 or st.saturation != 1:
+        look.append(f"eq=contrast={st.contrast}:saturation={st.saturation}")
+    look.append(f"setpts=(PTS-STARTPTS)/{speed}")
+    prep = f"[0:v]{','.join(look)}[mv];"
     if src_audio:
         prep += f"[0:a]asetpts=PTS-STARTPTS,atempo={speed}[ma];"
 
