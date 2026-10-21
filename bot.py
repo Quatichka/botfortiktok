@@ -7,9 +7,11 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, FSInputFile,
                            InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message)
@@ -56,6 +58,7 @@ logging.basicConfig(level=logging.INFO)
 dp = Dispatcher()
 user_seg: dict[int, int] = {}
 user_speed: dict[int, float] = {}
+user_cancel: dict[int, threading.Event] = {}  # «Остановить» для идущей обработки
 user_locks: dict[int, asyncio.Lock] = {}
 pending: dict[int, tuple[str, str | None]] = {}  # ссылка и своё название, пока выбирают баннер
 render_sem = asyncio.Semaphore(1)  # одновременно рендерим одно видео
@@ -277,22 +280,48 @@ async def choose_banner(cb: CallbackQuery, bot: Bot, bid: str):
     await process(cb.message, bot, uid, url, custom_title, banner)
 
 
+STOP_KB = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="⛔ Остановить обработку", callback_data="cancel")]])
+
+
+@dp.callback_query(F.data == "cancel")
+async def cb_cancel(cb: CallbackQuery):
+    event = user_cancel.get(cb.from_user.id)
+    if not event or event.is_set():
+        await cb.answer("Сейчас нечего останавливать")
+        return
+    event.set()
+    await cb.answer("Останавливаю…")
+    await cb.message.edit_reply_markup(reply_markup=None)
+
+
 async def process(msg: Message, bot: Bot, uid: int, url: str, custom_title: str | None,
                   banner: banners.Banner | None):
     lock = user_locks.setdefault(uid, asyncio.Lock())
     if lock.locked():
-        await msg.answer("Подожди, ещё обрабатываю предыдущее видео.")
+        await msg.answer("Подожди, ещё обрабатываю предыдущее видео — или нажми «⛔ Остановить».")
         return
 
     async with lock:
-        status = await msg.answer("⏬ <b>Скачиваю видео…</b>")
+        cancel = threading.Event()
+        user_cancel[uid] = cancel
+        status = await msg.answer("⏬ <b>Скачиваю видео…</b>", reply_markup=STOP_KB)
         workdir = Path(tempfile.mkdtemp(prefix="shorts_"))
+        head, done, total = "", 0, 0
+
+        async def say(text: str, stop_button: bool = True) -> None:
+            # Пока идёт работа, под статусом висит кнопка «Остановить»
+            try:
+                await status.edit_text(text, reply_markup=STOP_KB if stop_button and not cancel.is_set() else None)
+            except TelegramBadRequest:
+                pass  # текст не изменился — Telegram ругается, это не ошибка
+
         try:
-            src = await asyncio.to_thread(shorts.download, url, workdir, COOKIES, CUT_ADS)
+            src = await asyncio.to_thread(shorts.download, url, workdir, COOKIES, CUT_ADS, cancel)
             if custom_title:
                 src.title = custom_title
             if src.duration > MAX_DURATION:
-                await status.edit_text(f"❌ Видео длиннее {MAX_DURATION // 60} мин — слишком длинное.")
+                await say(f"❌ Видео длиннее {MAX_DURATION // 60} мин — слишком длинное.", False)
                 return
 
             # Видео ускоряется, поэтому из исходника берём больше секунд: готовая часть
@@ -306,16 +335,20 @@ async def process(msg: Message, bot: Bot, uid: int, url: str, custom_title: str 
                     + (f" · ⚡ {fmt_speed(style.speed)}" if style.speed != 1 else "")
                     + (f"\n✂️ Вырезано рекламы из ролика: <b>{int(src.ads_removed // 60)}:"
                        f"{int(src.ads_removed % 60):02d}</b>" if src.ads_removed else ""))
-            await status.edit_text(f"{head}\n\n✂️ Готовлю нарезку…")
+            await say(f"{head}\n\n⏳ Жду очереди на рендер…" if render_sem.locked()
+                      else f"{head}\n\n✂️ Готовлю нарезку…")
 
             async with render_sem:
                 for i, (start, length) in enumerate(parts, 1):
-                    await status.edit_text(f"{head}\n\n🎬 Рендер части {i} из {total}\n"
-                                           f"{progress_bar(i - 1, total)}")
+                    if cancel.is_set():
+                        raise shorts.Cancelled()
+                    await say(f"{head}\n\n🎬 Рендер части {i} из {total}\n{progress_bar(i - 1, total)}")
                     path = await asyncio.to_thread(
                         shorts.render_part, src, workdir, FONT_PATH,
-                        i, total, start, length, style, banner,
+                        i, total, start, length, style, banner, cancel,
                     )
+                    if cancel.is_set():
+                        raise shorts.Cancelled()
                     if path.stat().st_size > TG_LIMIT:
                         await msg.answer(f"Часть {i} больше 50 МБ — Telegram не даст отправить.")
                         continue
@@ -328,18 +361,25 @@ async def process(msg: Message, bot: Bot, uid: int, url: str, custom_title: str 
                         duration=int(shorts.probe_duration(path)), supports_streaming=True,
                     )
                     path.unlink(missing_ok=True)
-            await status.edit_text(f"{head}\n\n✅ <b>Готово!</b> {progress_bar(total, total)}\n"
-                                   "Пришли следующую ссылку 👇")
+                    done = i
+            await say(f"{head}\n\n✅ <b>Готово!</b> {progress_bar(total, total)}\nПришли следующую ссылку 👇",
+                      False)
+        except shorts.Cancelled:
+            got = f"Готово частей: <b>{done} из {total}</b> — они выше в чате." if done else \
+                "Готовых частей нет."
+            await say(f"{head}\n\n⛔ <b>Обработка остановлена.</b> {got}\nПришли новую ссылку 👇".lstrip(),
+                      False)
         except shorts.LoginRequired:
             logging.warning("YouTube требует cookies: %s", url)
-            await status.edit_text(LOGIN_HELP if not COOKIES.is_file() else
-                                   "❌ YouTube не принял cookies — похоже, они устарели. "
-                                   "Выгрузите <code>cookies.txt</code> заново и замените файл в папке "
-                                   "<code>data</code> на BotHost.")
+            await say(LOGIN_HELP if not COOKIES.is_file() else
+                      "❌ YouTube не принял cookies — похоже, они устарели. "
+                      "Выгрузите <code>cookies.txt</code> заново и замените файл в папке "
+                      "<code>data</code> на BotHost.", False)
         except Exception as e:
             logging.exception("Ошибка обработки %s", url)
-            await status.edit_text(f"❌ Ошибка: {str(e)[:300]}")
+            await say(f"❌ Ошибка: {html.escape(str(e)[:300])}", False)
         finally:
+            user_cancel.pop(uid, None)
             shutil.rmtree(workdir, ignore_errors=True)
 
 

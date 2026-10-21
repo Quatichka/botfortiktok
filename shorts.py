@@ -3,6 +3,7 @@ import math
 import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -83,8 +84,27 @@ class LoginRequired(RuntimeError):
     """YouTube требует подтвердить, что запрос не от бота (нужны cookies)."""
 
 
+class Cancelled(Exception):
+    """Пользователь нажал «Остановить»."""
+
+
+def _run(cmd: list[str], cancel: threading.Event | None = None) -> tuple[int, str]:
+    """Запускает ffmpeg; если нажали «Остановить», сразу убивает процесс."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace")
+    while True:
+        try:
+            _, err = proc.communicate(timeout=0.5)
+            return proc.returncode, err
+        except subprocess.TimeoutExpired:
+            if cancel and cancel.is_set():
+                proc.kill()
+                proc.communicate()
+                raise Cancelled()
+
+
 def download(url: str, workdir: Path, cookies: Path | None = None,
-             cut_ads: bool = True) -> Downloaded:
+             cut_ads: bool = True, cancel: threading.Event | None = None) -> Downloaded:
     opts = {
         "outtmpl": str(workdir / "source.%(ext)s"),
         # res — меньшая сторона кадра, так что 1080 подходит и для горизонтальных, и для
@@ -104,6 +124,12 @@ def download(url: str, workdir: Path, cookies: Path | None = None,
     # YouTube часто не пускает IP дата-центров без входа в аккаунт — тогда нужны cookies
     if cookies and cookies.is_file():
         opts["cookiefile"] = str(cookies)
+    if cancel:
+        # yt-dlp вызывает хук на каждом скачанном куске — там и прерываем
+        def stop_if_cancelled(_):
+            if cancel.is_set():
+                raise yt_dlp.utils.DownloadCancelled("остановлено пользователем")
+        opts["progress_hooks"] = [stop_if_cancelled]
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             if cut_ads:
@@ -111,7 +137,11 @@ def download(url: str, workdir: Path, cookies: Path | None = None,
                 # вырезатель yt-dlp требует ffprobe, которого в imageio-ffmpeg нет
                 ydl.add_post_processor(_SafeSponsorBlock(ydl, categories=AD_CATEGORIES), when="after_filter")
             info = ydl.extract_info(url, download=True)
-    except yt_dlp.utils.DownloadError as e:
+    except Exception as e:
+        if cancel and cancel.is_set():
+            raise Cancelled() from e
+        if not isinstance(e, yt_dlp.utils.DownloadError):
+            raise
         if "confirm you" in str(e) and "not a bot" in str(e):
             raise LoginRequired(str(e)) from e
         raise
@@ -378,7 +408,7 @@ def _banner_graph(banner: Banner, d: float, src_audio: bool) -> tuple[str, str, 
 
 def render_part(src: Downloaded, workdir: Path, font: Path, index: int, total: int,
                 start: float, length: float, st: Style | None = None,
-                banner: Banner | None = None) -> Path:
+                banner: Banner | None = None, cancel: threading.Event | None = None) -> Path:
     st = st or Style()
     overlay = workdir / f"overlay_{index:02d}.png"
     make_overlay(src.title, st.part_label.format(n=index, total=total), font, st, overlay)
@@ -432,12 +462,11 @@ def render_part(src: Downloaded, workdir: Path, font: Path, index: int, total: i
         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
         str(out),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True,
-                         encoding="utf-8", errors="replace")
-    if res.returncode != 0:
+    code, stderr = _run(cmd, cancel)
+    if code != 0:
         # Граф фильтров длинный и забивает сообщение — вырезаем его
-        err = res.stderr.replace(graph, "<filters>").strip()
-        if res.returncode in (-9, 137) and not err:
+        err = stderr.replace(graph, "<filters>").strip()
+        if code in (-9, 137) and not err:
             raise RuntimeError("ffmpeg убит системой — скорее всего, не хватило памяти")
-        raise RuntimeError(f"ffmpeg (код {res.returncode}): {err[:400] or 'без сообщения'}")
+        raise RuntimeError(f"ffmpeg (код {code}): {err[:400] or 'без сообщения'}")
     return out
